@@ -1,0 +1,4 @@
+battle_logs/
+__pycache__/
+*.pyc
+.venv/
