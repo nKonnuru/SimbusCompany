@@ -22,6 +22,11 @@ TREMOR_SUBTYPES: tuple[str, ...] = (
     "hemmorage",
 )
 
+# Sanity's general valid range, enforced by adjust_sp() rather than by
+# individual effects clamping it themselves.
+SANITY_MIN = -45
+SANITY_MAX = 45
+
 
 @dataclass
 class Enemy:
@@ -41,6 +46,10 @@ class Enemy:
         Current hit points.
     max_hp : int
         Maximum hit points.
+    shield : int
+        Damage buffer absorbed before HP on every ``take_damage`` call
+        (e.g. granted by Charge Barrier). Does not decay on its own —
+        only consumed by taking damage.
     phys_res : dict[str, float]
         Physical resistance by type (e.g. ``{"Slash": 1.0, "Pierce": 0.5}``).
         ``1.0`` = neutral, ``>1.0`` = resists, ``<1.0`` = weak.
@@ -48,6 +57,17 @@ class Enemy:
         Sin resistance by type (e.g. ``{"Wrath": 1.0, "Lust": 0.5}``).
     speed : int
         The enemy's speed value, used for speed-comparison-based effects.
+    sp : int
+        Sanity — shifts coin-flip odds (base 50 + sp) for whoever is
+        resolving a skill (see ``GameLoop._resolve_coin``). Kept within
+        ``[SANITY_MIN, SANITY_MAX]`` via ``adjust_sp``. Lives here (not
+        just on ``Unit``) so skills like Sinking can read/write it on
+        any entity.
+    has_sanity : bool
+        Whether this entity tracks sanity at all. Most enemies don't
+        (defaults ``False``); ``Unit`` defaults it ``True`` instead,
+        since player Identities always have sanity. Effects like Sinking
+        branch on this to decide their behavior.
     observation_level : int
         Number of observation stacks on this enemy (3 %% per level to static).
     statuses : dict[str, Any]
@@ -67,9 +87,12 @@ class Enemy:
     defense_level: int = 0
     hp: int = 100
     max_hp: int = 100
+    shield: int = 0
     phys_res: dict[str, float] = field(default_factory=dict)
     sin_res: dict[str, float] = field(default_factory=dict)
     speed: int = 0
+    sp: int = 0
+    has_sanity: bool = False
     observation_level: int = 0
     statuses: dict[str, Any] = field(default_factory=dict)
     next_turn_statuses: dict[str, Any] = field(default_factory=dict)
@@ -86,6 +109,31 @@ class Enemy:
         """Actual defense value = base_level + defense_level offset."""
         return self.base_level + self.defense_level
 
+    @property
+    def effective_speed(self) -> int:
+        """
+        Speed for this turn, adjusted by Haste and Bind.
+
+        ``haste`` and ``bind`` simply add together onto ``speed``
+        (Haste positive, Bind negative), floored at 1. Both statuses are
+        cleared at turn end via ``TURN_END_EFFECTS_TO_CLEAR``.
+        """
+        haste = max(0, int(self.get_status("haste", 0)))
+        bind = max(0, int(self.get_status("bind", 0)))
+        return max(1, self.speed + haste - bind)
+
+    def adjust_sp(self, delta: int) -> int:
+        """
+        Change ``sp`` by *delta*, clamped to the general Sanity range
+        ``[SANITY_MIN, SANITY_MAX]``. Effects that change sanity (e.g.
+        Sinking, a Clash Lose penalty) should go through this instead of
+        clamping ad hoc, so the range stays enforced in one place.
+
+        Returns the resulting ``sp`` value.
+        """
+        self.sp = max(SANITY_MIN, min(SANITY_MAX, self.sp + delta))
+        return self.sp
+
     # ── HP helpers ───────────────────────────────────────────────────
 
     @property
@@ -94,10 +142,19 @@ class Enemy:
 
     def take_damage(self, amount: int) -> int:
         """
-        Reduce HP by *amount* (clamped to 0).  Returns actual damage taken.
+        Reduce HP by *amount* (clamped to 0), absorbing from ``shield``
+        first. Returns actual HP damage taken (amount absorbed by shield
+        is not included).
         """
         old_hp = self.hp
-        actual = min(amount, self.hp)
+        remaining = max(0, int(amount))
+
+        if self.shield > 0 and remaining > 0:
+            absorbed = min(self.shield, remaining)
+            self.shield -= absorbed
+            remaining -= absorbed
+
+        actual = min(remaining, self.hp)
         self.hp -= actual
         self._update_stagger_from_hp(old_hp)
         return actual
@@ -199,13 +256,88 @@ class Enemy:
 
     def set_status(self, status_name: str, value: Any) -> None:
         self.statuses[status_name] = value
-        if status_name in {"tremor_type", "tremor_potency", "tremor_count"}:
-            self.refresh_tremor_decay_effect()
 
     def remove_status(self, status_name: str) -> None:
         self.statuses.pop(status_name, None)
-        if status_name in {"tremor_type", "tremor_potency", "tremor_count"}:
-            self.refresh_tremor_decay_effect()
+
+    def add_status(self, status_name: str, amount: int, cap: int = 99, init_partner: bool = True) -> int:
+        """
+        Add `amount` to status_name: if it's currently set, the new value
+        is current + amount; otherwise the status is created fresh at
+        amount. Result is capped at `cap`. Returns the resulting value.
+
+        Use this instead of hand-rolling get/add/clamp/set for any "gain N
+        potency/count" effect that targets a specific entity directly
+        (e.g. an on-hit debuff that must always land on env.enemy).
+
+        If status_name ends with "_potency" or "_count", the resulting
+        value is positive, and init_partner is True (the default), also
+        initializes its paired key (swap the suffix) to 1 if that partner
+        is currently 0/absent — mirroring reduce_status's suffix-based
+        pairing on the gain side, so a potency/count pair a skill grants
+        one side of doesn't sit with the other side missing. No registry,
+        same suffix-swap reduce_status uses.
+
+        Pass init_partner=False for a gain that should deliberately stay
+        one-sided (e.g. a stat that accumulates independently of its usual
+        partner for a specific effect).
+        """
+        if self.has_status(status_name):
+            new_value = self.get_status(status_name, 0) + amount
+        else:
+            new_value = amount
+        new_value = min(new_value, cap)
+        self.set_status(status_name, new_value)
+
+        if new_value > 0 and init_partner:
+            if status_name.endswith("_potency"):
+                partner = status_name[: -len("_potency")] + "_count"
+            elif status_name.endswith("_count"):
+                partner = status_name[: -len("_count")] + "_potency"
+            else:
+                partner = None
+            if partner is not None and self.get_status(partner, 0) <= 0:
+                self.set_status(partner, 1)
+
+        return new_value
+
+    def reduce_status(self, status_name: str, amount: int, cleanup: bool = True) -> int:
+        """
+        Reduce status_name by amount, floored at 0, removing it once it
+        reaches 0 (same "decrement, remove at 0" contract every reduce
+        site in this codebase already follows). Returns the resulting
+        value (0 if removed).
+
+        If cleanup is True (the default) and status_name is now removed,
+        also removes its paired key by swapping the "_potency"/"_count"
+        suffix (e.g. reducing "rupture_count" to 0 also removes
+        "rupture_potency", and vice versa) — a potency/count pair should
+        never linger with only one side zeroed. status_name is matched
+        purely by its own suffix; there's no registry of "paired" status
+        names to maintain.
+
+        Pass cleanup=False when the status must keep tracking independently
+        of its partner even at 0 (e.g. Charge Potency, which persists past
+        Charge Count reaching 0 — Charge Count itself is still removed).
+        """
+        current = self.get_status(status_name, 0)
+        new_value = max(0, current - amount)
+
+        if new_value <= 0:
+            self.remove_status(status_name)
+            if cleanup:
+                if status_name.endswith("_potency"):
+                    partner = status_name[: -len("_potency")] + "_count"
+                elif status_name.endswith("_count"):
+                    partner = status_name[: -len("_count")] + "_potency"
+                else:
+                    partner = None
+                if partner is not None:
+                    self.remove_status(partner)
+        else:
+            self.set_status(status_name, new_value)
+
+        return new_value
 
     def queue_next_turn_status(self, status_name: str, value: Any) -> None:
         """Queue a status to be applied at the start of the next turn."""
@@ -254,37 +386,26 @@ class Enemy:
         self.set_status("tremor_type", str(new_type).strip().lower())
         return True
 
-    def refresh_tremor_decay_effect(self) -> None:
+    def tremor_decay_def_level_down(self) -> int:
         """
-        Recompute Tremor Decay's derived defense-level-down status.
+        Defense levels lost to Tremor Decay: 1 per 4 Tremor potency.
 
-        Rule:
-        - If active Tremor type is "decay", lose 1 defense level per 4
-          Tremor potency (floor division).
-        - Otherwise remove the derived status.
+        Derived on read rather than stored as a status, so it needs no
+        recompute after a Tremor change and can never disagree with the
+        Tremor state it comes from — whichever route that change took
+        (``add_status``, ``set_status``, ``reduce_status``, or a
+        constructor-supplied ``statuses`` dict, which bypasses them all).
+
+        Skill-applied Defense Level Down is the separate ``def_lvl_down``
+        status; ``Environment.def_level`` subtracts both.
         """
         tremor_type = str(self.get_status("tremor_type", "")).strip().lower()
         if tremor_type != "decay" or not self.has_tremor():
-            self.remove_status("defense_level_down")
-            return
+            return 0
 
-        tremor_potency = max(0, int(self.get_status("tremor_potency", 0)))
-        down = tremor_potency // 4
-        if down > 0:
-            self.statuses["defense_level_down"] = down
-        else:
-            self.remove_status("defense_level_down")
+        return max(0, int(self.get_status("tremor_potency", 0))) // 4
 
     # ── passive helpers ──────────────────────────────────────────────
-
-    def add_charge_count(self, amount: int) -> None:
-        """Add *amount* to charge_count, auto-setting potency to 1 if it was 0."""
-        current_potency = self.get_status("charge_potency", 0)
-        current_count = self.get_status("charge_count", 0)
-        new_count = max(0, current_count + amount)
-        self.set_status("charge_count", min(new_count, 99))
-        if current_potency == 0 and new_count > 0:
-            self.set_status("charge_potency", 1)
 
     def add_passive(self, passive: Passive) -> None:
         self.passives.append(passive)

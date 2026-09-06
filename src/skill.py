@@ -27,7 +27,15 @@ class Skill:
     name : str
         Human-readable skill name.
     speed : int
-        Determines activation order within the turn (higher = faster).
+        Ordering fallback for a skill with no resolvable owner (e.g. a
+        standalone skill passed via ``GameLoop.skills``). An owned
+        skill's turn order comes from its ``Action``'s explicit speed if
+        set, else its owner's ``effective_speed`` (so Haste/Bind apply)
+        — see ``Action.resolve_speed`` and ``GameLoop._order_actions``.
+        Ownership itself is never stored on the skill; it's threaded
+        through per turn via ``Action`` (or, for legacy callers,
+        recovered from ``Unit.skills``), so this field only matters in
+        the ownerless case.
     base_power : int
         Flat base damage of the skill before coins are resolved.
     coin_power : int

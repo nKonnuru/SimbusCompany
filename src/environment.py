@@ -15,12 +15,22 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from src.utils import PHYSICAL_DAMAGE_TYPES, SIN_DAMAGE_TYPES
+
 if TYPE_CHECKING:
     from src.coin import Coin
     from src.effect import Effect
     from src.enemy import Enemy
     from src.skill import Skill
     from src.unit import Unit
+
+
+def _status_stack_bonus(entity: Any, status_name: str) -> float:
+    """+10% dynamic per stack of *status_name* on *entity*, capped at +100%."""
+    if entity is None:
+        return 0.0
+    stacks = max(0, int(entity.get_status(status_name, 0)))
+    return min(stacks, 10) * 0.1
 
 
 @dataclass
@@ -88,7 +98,7 @@ class Environment:
     dynamic: float = 1.0
     p_res_mod: float = 0.0        # physical resistance modifier
     s_res_mod: float = 0.0        # sin resistance modifier
-    ol: int = 0                    # attacker offense level (skill OL + unit level)
+    ol: int = 0                    # raw attacker offense level (skill OL + unit level); see effective_ol
     def_level_mod: int = 0         # dynamic defense-level adjustment
 
     # ── combat state ─────────────────────────────────────────────────
@@ -101,6 +111,7 @@ class Environment:
     # ── damage breakdown tracking ────────────────────────────────────
     coin_damages: list[int] = field(default_factory=list)        # skill damage per coin
     status_damages: dict[str, int] = field(default_factory=dict) # total damage per status
+    self_damage: dict[str, int] = field(default_factory=dict)    # damage the actor deals to itself (not in total)
 
     # ── crit ─────────────────────────────────────────────────────────
     crit_bonus: float = 0.20       # added to static on crit
@@ -136,6 +147,14 @@ class Environment:
     effects: dict[Any, list] = field(default_factory=dict)
     apply_queue: list[Any] = field(default_factory=list)
     _updating_queue: bool = field(default=False, init=False, repr=False)
+
+    # ── turn context ─────────────────────────────────────────────────
+    # This skill's position in the turn's chain (speed order, fastest
+    # first), copied from its Action. -1 when there is no single
+    # resolving skill — notably the shared broadcast env used for
+    # turn_start / combat_start / turn_end. Lets an effect ask about its
+    # own Sin Resonance run; see ResonanceResult.chain_at.
+    chain_index: int = -1
 
     # ── logging / debug ──────────────────────────────────────────────
     log: list[str] = field(default_factory=list)
@@ -207,12 +226,46 @@ class Environment:
     # ══════════════════════════════════════════════════════════════════
 
     @property
+    def effective_ol(self) -> int:
+        """
+        Attacker Offense Level after Offense Level Up/Down statuses.
+
+        ``ol`` itself stays the raw figure — skill OL + base level, plus
+        any Sin Resonance bonus folded in by ``_resolve_action`` — so the
+        volatile statuses layer on top at read time without the engine
+        having to unwind them later. Mirrors ``Enemy.effective_speed``'s
+        Haste/Bind handling; both statuses are cleared at turn end via
+        ``TURN_END_EFFECTS_TO_CLEAR``.
+        """
+        if self.unit is None:
+            return self.ol
+        up = max(0, int(self.unit.get_status("off_lvl_up", 0)))
+        down = max(0, int(self.unit.get_status("off_lvl_down", 0)))
+        return self.ol + up - down
+
+    @property
     def def_level(self) -> int:
-        """Enemy effective defense, allowing effects to shift it."""
+        """
+        Enemy effective defense, allowing effects to shift it.
+
+        Sums three independent sources: ``def_level_mod`` (per-resolution
+        adjustment an effect can write), the volatile ``def_lvl_up`` /
+        ``def_lvl_down`` statuses, and Tremor Decay's derived reduction.
+        Decay is *not* a status — see ``Enemy.tremor_decay_def_level_down``
+        — so the turn-end status sweep leaves it alone and it applies for
+        exactly as long as Decay Tremor does.
+        """
         if self.enemy is None:
             return 0
-        defense_level_down = max(0, int(self.enemy.get_status("defense_level_down", 0)))
-        return self.enemy.effective_defense + self.def_level_mod - defense_level_down
+        up = max(0, int(self.enemy.get_status("def_lvl_up", 0)))
+        down = max(0, int(self.enemy.get_status("def_lvl_down", 0)))
+        return (
+            self.enemy.effective_defense
+            + self.def_level_mod
+            + up
+            - down
+            - self.enemy.tremor_decay_def_level_down()
+        )
 
     # ══════════════════════════════════════════════════════════════════
     #  Static multiplier recomputation
@@ -224,8 +277,12 @@ class Environment:
         observation, and clash count.  Called during construction and
         again before damage on each coin, because effects may have
         shifted OL, def_level, or resists in the meantime.
+
+        Reads ``effective_ol`` / ``def_level`` rather than the raw
+        ``ol`` field, so Offense/Defense Level statuses applied mid-skill
+        take effect from the next coin onward.
         """
-        ol_diff = self.ol - self.def_level
+        ol_diff = self.effective_ol - self.def_level
         ol_mult = ol_diff / (abs(ol_diff) + 25) if (abs(ol_diff) + 25) != 0 else 0.0
 
         observation = 0.0
@@ -294,25 +351,59 @@ class Environment:
         return effective_static
 
     def get_fragility_dynamic_bonus(self) -> float:
-        """Return extra dynamic bonus granted by fragility-like statuses."""
+        """
+        Return extra dynamic bonus granted by Fragility-family statuses on
+        the target (``self.enemy``): a generic ``fragility`` (any attack),
+        plus one per physical type (``slash_fragility``, etc.) and one per
+        sin type (``wrath_fragility``, etc.) that only applies when the
+        attacking skill matches that type. Each is +10% per stack, capped
+        at 10 stacks (+100%). Cleared from the target at turn end.
+        """
         if self.skill is None or self.enemy is None:
             return 0.0
 
         phys_type = str(self.skill.damage_type[0]).strip().lower()
-        bonus = 0.0
+        sin_type = str(self.skill.damage_type[1]).strip().lower()
 
-        if phys_type == "slash":
-            slash_fragility = max(0, int(self.enemy.get_status("slash_fragility", 0)))
-            bonus += min(slash_fragility, 10) * 0.1
+        bonus = _status_stack_bonus(self.enemy, "fragility")
+        if phys_type in PHYSICAL_DAMAGE_TYPES:
+            bonus += _status_stack_bonus(self.enemy, f"{phys_type}_fragility")
+        if sin_type in SIN_DAMAGE_TYPES:
+            bonus += _status_stack_bonus(self.enemy, f"{sin_type}_fragility")
+
+        return bonus
+
+    def get_damage_up_dynamic_bonus(self) -> float:
+        """
+        Return extra dynamic bonus granted by Damage Up-family statuses on
+        the attacker (``self.unit``): a generic ``dmg_up`` (any skill),
+        plus one per physical type (``pierce_dmg_up``, etc.) and one per
+        sin type (``wrath_dmg_up``, etc.) that only applies when the used
+        skill matches that type. Each is +10% per stack, capped at 10
+        stacks (+100%). Cleared from the unit at turn end.
+        """
+        if self.skill is None or self.unit is None:
+            return 0.0
+
+        phys_type = str(self.skill.damage_type[0]).strip().lower()
+        sin_type = str(self.skill.damage_type[1]).strip().lower()
+
+        bonus = _status_stack_bonus(self.unit, "dmg_up")
+        if phys_type in PHYSICAL_DAMAGE_TYPES:
+            bonus += _status_stack_bonus(self.unit, f"{phys_type}_dmg_up")
+        if sin_type in SIN_DAMAGE_TYPES:
+            bonus += _status_stack_bonus(self.unit, f"{sin_type}_dmg_up")
 
         return bonus
 
     def get_dynamic_breakdown(self) -> tuple[float, float, float]:
-        """Return (coin_dynamic, fragility_bonus, total_dynamic)."""
+        """Return (coin_dynamic, status_dynamic_bonus, total_dynamic)."""
         coin_dynamic = self.coin_env.dynamic if self.coin_env is not None else 0.0
-        fragility_bonus = self.get_fragility_dynamic_bonus()
-        total_dynamic = self.dynamic + coin_dynamic + fragility_bonus
-        return coin_dynamic, fragility_bonus, total_dynamic
+        status_bonus = (
+            self.get_fragility_dynamic_bonus() + self.get_damage_up_dynamic_bonus()
+        )
+        total_dynamic = self.dynamic + coin_dynamic + status_bonus
+        return coin_dynamic, status_bonus, total_dynamic
 
     def get_stagger_debug(self) -> str:
         """Return a compact stagger debug suffix for log lines."""
@@ -596,11 +687,7 @@ class Environment:
                         )
 
                 burn_count = max(0, int(self.enemy.get_status("burn_count", 0)))
-                new_burn_count = max(0, burn_count - 1)
-                if new_burn_count == 0:
-                    self.enemy.remove_status("burn_count")
-                else:
-                    self.enemy.set_status("burn_count", min(new_burn_count, 99))
+                new_burn_count = self.enemy.reduce_status("burn_count", 1)
                 if self.is_debugging and burn_count > 0:
                     self.log.append(
                         f"     [tremor_scorch] burn_count {burn_count} -> {new_burn_count}"
@@ -630,11 +717,7 @@ class Environment:
                         )
 
                 bleed_count = max(0, int(self.enemy.get_status("bleed_count", 0)))
-                new_bleed_count = max(0, bleed_count - 1)
-                if new_bleed_count == 0:
-                    self.enemy.remove_status("bleed_count")
-                else:
-                    self.enemy.set_status("bleed_count", min(new_bleed_count, 99))
+                new_bleed_count = self.enemy.reduce_status("bleed_count", 1)
                 if self.is_debugging and bleed_count > 0:
                     self.log.append(
                         f"     [tremor_hemmorage] bleed_count {bleed_count} -> {new_bleed_count}"
@@ -650,6 +733,59 @@ class Environment:
             if hasattr(effect, "on_tremor_burst"):
                 effect.on_tremor_burst(effect, self)
         self.update_apply_queue()
+
+    def proc_bleed(self, entity: "Enemy | None", procs: int, *, is_self: bool) -> int:
+        """
+        Resolve up to *procs* Bleed procs on *entity*, bounded by its own
+        ``bleed_count``.  Each proc deals ``bleed_potency`` damage.  Procs that
+        would land after the entity is already dead are not spent — the lethal
+        case is solved closed-form (no loop), so leftover Bleed / clash budget
+        is never wasted on an overkill.
+
+        ``bleed_count`` is reduced by the number of procs that actually fired,
+        but only when ``self.CONSUME_BLEED`` is True; when False the damage
+        still lands and the count is left intact.
+
+        ``is_self=True`` books the damage to ``self_damage['bleed']`` and keeps
+        it out of ``total`` (the actor hurting itself is not skill output);
+        ``is_self=False`` books to ``status_damages['bleed']`` and ``total``
+        (a clash opponent bleeding is enemy-directed damage).
+
+        Returns the HP damage dealt (0 if nothing happened).  The caller is
+        responsible for checking ``entity.is_alive`` and setting
+        ``target_killed`` / ``CANCEL_ATTACK`` as appropriate.
+        """
+        if entity is None or not entity.is_alive:
+            return 0
+
+        potency = max(0, int(entity.get_status("bleed_potency", 0)))
+        count = max(0, int(entity.get_status("bleed_count", 0)))
+        n = min(max(0, int(procs)), count)
+        if potency <= 0 or n <= 0:
+            return 0
+
+        # Bleed is absorbed by shield first (via take_damage), so shield counts
+        # toward what the procs must chew through before a kill.
+        effective_hp = entity.shield + entity.hp
+        if potency * n >= effective_hp:
+            n = min(n, math.ceil(effective_hp / potency))
+
+        dealt = entity.take_damage(potency * n)
+
+        if self.CONSUME_BLEED:
+            entity.reduce_status("bleed_count", n)
+
+        bucket = self.self_damage if is_self else self.status_damages
+        bucket["bleed"] = bucket.get("bleed", 0) + dealt
+        if not is_self:
+            self.total += dealt
+
+        self.log.append(
+            f"     [bleed] {entity.name} took {dealt} "
+            f"(potency={potency} x {n} proc{'s' if n != 1 else ''}) -> "
+            f"HP {entity.hp}/{entity.max_hp}"
+        )
+        return dealt
 
     # ══════════════════════════════════════════════════════════════════
     #  Convenience / legacy compatibility
@@ -687,5 +823,5 @@ class Environment:
             f"damage={self.current_damage}, static={effective_static:.3f}, "
             f"dynamic={total_dyn:.3f}, "
             f"p_res={self.p_res_mod:.3f}, s_res={self.s_res_mod:.3f}, "
-            f"ol_diff={self.ol - self.def_level}, {stagger_debug}, {stagger_preview}"
+            f"ol_diff={self.effective_ol - self.def_level}, {stagger_debug}, {stagger_preview}"
         )

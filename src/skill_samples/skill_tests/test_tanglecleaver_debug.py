@@ -59,6 +59,7 @@ def _dump_entity(entity, label: str) -> None:
         print(f"    sp                 = {entity.sp}")
         print(f"    poise              = {entity.get_status('poise', 0)}")
         print(f"    poise_count        = {entity.get_status('poise_count', 0)}")
+    if hasattr(entity, "skills"):
         print(f"    skills             = {[s.name for s in entity.skills]}")
 
 

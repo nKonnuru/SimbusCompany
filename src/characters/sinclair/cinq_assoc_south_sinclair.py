@@ -12,7 +12,6 @@ from src.utils import (
     add_coin_power,
     add_dynamic,
     add_enemy_status,
-    add_poise_count,
     add_status,
     queue_status,
     check_count,
@@ -72,10 +71,10 @@ def _make_skill_1_remise() -> Skill:
     )
     skill.add_effect(
         Effect(
-            name="On Use: Gain +2 Poise.pngPoise Count]",
+            name="On Use: Gain +2 Poise Count",
             phase=SkillPhase.ON_USE,
-            apply=add_poise_count,
-            args=(2,),
+            apply=add_status,
+            args=("poise_count", 2),
         )
     )
 
@@ -88,8 +87,8 @@ def _make_skill_2_engagement() -> Skill:
         Effect(
             name="On Hit: Gain +1 Poise Count",
             phase=CoinPhase.ON_HIT,
-            apply=add_poise_count,
-            args=(1,),
+            apply=add_status,
+            args=("poise_count", 1),
         )
     )
 
@@ -98,8 +97,8 @@ def _make_skill_2_engagement() -> Skill:
         Effect(
             name="On Hit: Gain +1 Poise Count",
             phase=CoinPhase.ON_HIT,
-            apply=add_poise_count,
-            args=(1,),
+            apply=add_status,
+            args=("poise_count", 1),
         )
     )
 
@@ -128,8 +127,8 @@ def _make_skill_2_engagement() -> Skill:
         Effect(
             name="Clash Win: Gain +2 Poise Count",
             phase=SkillPhase.CLASH_WIN,
-            apply=add_poise_count,
-            args=(2,),
+            apply=add_status,
+            args=("poise_count", 2),
         )
     )
 
@@ -188,8 +187,7 @@ def _make_skill_3_contre_attaque() -> Skill:
                 if env.enemy is not None and env.enemy.has_status("Declared Duel - Sinclair"):
                     consumed_poise *= 2
                 env.unit.set_status("poise_count", max(current_poise - 10, 1))
-                current_poise_amount = int(env.unit.get_status("poise", 0))
-                env.unit.set_status("poise", current_poise_amount + consumed_poise)
+                env.unit.add_status("poise_potency", consumed_poise)
             
                 
 
@@ -206,7 +204,7 @@ def _make_skill_3_contre_attaque() -> Skill:
             name = "Clash Win: If this unite conducted a Single Combat with the target Slot's Attack Skill, inflict 1 Fragile On Hit (Twice per Turn)",
             phase = SkillPhase.CLASH_WIN,
             apply = add_enemy_status,
-            args = ("Fragile", 1, 10),
+            args = ("fragility", 1, 10),
             max_procs = 2
         )
     )
@@ -268,10 +266,14 @@ def _make_passive_Slumbering_Bloodthirst() -> Passive:
         )
     )
 
+    # Combat Start, not Turn End: the buff is granted before any skill
+    # resolves, so this turn's Pierce skills are boosted by it, and the
+    # standard TURN_END_EFFECTS_TO_CLEAR sweep removes it afterwards.
+    # Applied directly rather than queued for the same reason.
     passive.add_effect(
         Effect(
-            name="Turn End: If all allies are faster than all enemies, gain +1 Pierce DMG up next turn",
-            phase=SkillPhase.TURN_END,
+            name="Combat Start: If all allies are faster than all enemies, gain +1 Pierce DMG Up",
+            phase=SkillPhase.COMBAT_START,
             apply=add_status,
             args=("pierce_dmg_up", 1, 10),
             condition=check_all_allies_faster,

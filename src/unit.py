@@ -30,6 +30,16 @@ class Unit(Enemy):
         The skills this unit can use in combat.
     speed : int
         Base speed value influencing turn order.
+    charge_consumed_total : int
+        Lifetime count of Charge Count this unit has spent via
+        ``utils.consume_charge_count``. Tracked for every unit regardless
+        of identity.
+    gains_charge_potency_on_consume : bool
+        Identity trait: if True, ``consume_charge_count`` grants +1
+        Charge Potency for every 10 cumulative Charge Count consumed.
+    has_sanity : bool
+        Inherited from Enemy, but defaulted True here — player Identities
+        always have sanity (``sp``), unlike most enemies.
 
     Example
     -------
@@ -52,7 +62,14 @@ class Unit(Enemy):
     speed: int = 0
     speed_min: int = 0
     speed_max: int = 0
-    sp: int = 0                # sanity — shifts coin-flip odds (base 50 + sp)
+    has_sanity: bool = True     # overrides Enemy's default: Units always have sanity
+
+    # Lifetime Charge Count consumption tracking. Every unit accumulates
+    # this regardless of identity; only units with
+    # ``gains_charge_potency_on_consume`` set convert it into Charge
+    # Potency (see ``utils.consume_charge_count``).
+    charge_consumed_total: int = 0
+    gains_charge_potency_on_consume: bool = False
 
     def __post_init__(self) -> None:
         # Keep the old flat skills list as the execution source, but allow
@@ -85,10 +102,21 @@ class Unit(Enemy):
         return list(self.skill_slots.get(slot, []))
 
     def roll_speed(self, rng: random.Random | None = None) -> int:
-        """Roll and set current speed from [speed_min, speed_max] range."""
+        """
+        Roll and set current speed from [speed_min, speed_max] range.
+
+        Active ``max_speed_up``/``min_speed_up`` statuses raise the
+        ceiling/floor for this roll only (both statuses are cleared at
+        turn end).
+        """
         if self.speed_min <= 0 or self.speed_max < self.speed_min:
             return self.speed
 
+        min_speed_bonus = max(0, int(self.get_status("min_speed_up", 0)))
+        max_speed_bonus = max(0, int(self.get_status("max_speed_up", 0)))
+        effective_min = self.speed_min + min_speed_bonus
+        effective_max = max(self.speed_max + max_speed_bonus, effective_min)
+
         roller = rng if rng is not None else random
-        self.speed = roller.randint(self.speed_min, self.speed_max)
+        self.speed = roller.randint(effective_min, effective_max)
         return self.speed

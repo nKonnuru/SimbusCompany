@@ -67,9 +67,12 @@ if self.s_res_mod < 0: self.s_res_mod /= 2
 #### Offense Level vs Defense Level
 
 ```python
-self.ol = skill.ol + unit.level
-ol_mult = (self.def_level - self.ol) / (abs(self.def_level - self.ol) + 25)
+self.ol = skill.offense_level + unit.base_level
+ol_diff = self.effective_ol - self.def_level
+ol_mult = ol_diff / (abs(ol_diff) + 25)
 ```
+
+Both sides are **properties**, not the raw fields. `effective_ol` layers the `off_lvl_up`/`off_lvl_down` statuses onto `self.ol` (which itself holds `skill.offense_level + unit.base_level` plus any Sin Resonance bonus); `def_level` layers `def_lvl_up`/`def_lvl_down`, `def_level_mod`, and Tremor Decay's derived reduction onto the enemy's `effective_defense`.
 
 This is a **sigmoid-shaped** scaling curve. Large OL advantages give diminishing returns. For example:
 - OL 10 above def: `10 / (10 + 25) = +0.286`
@@ -108,7 +111,9 @@ All additive: base 1.0 + OL modifier + physical resist + sin resist + 3% per obs
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `CONSUME_RUPTURE` | `True` | If `False`, Rupture is not consumed on hit |
+| `CONSUME_RUPTURE` | `True` | If `False`, Rupture still deals its on-hit damage but `rupture_count` is not consumed (and the Deathrite rider does not fire) |
+| `CONSUME_BLEED` | `True` | If `False`, Bleed still deals its damage but `bleed_count` is not consumed |
+| `CONSUME_SINKING` | `True` | If `False`, Sinking is not applied on hit |
 | `CONSUME_POISE` | `True` | If `False`, Poise Count is not consumed on crit |
 | `CANCEL_ATTACK` | `False` | If set `True` by an effect, the entire attack ends after the current coin |
 | `CANCEL_COIN` | `False` | If set `True` by an effect, the current coin is skipped (no damage) |
@@ -120,10 +125,34 @@ All additive: base 1.0 + OL modifier + physical resist + sin resist + 3% per obs
 ```python
 @property
 def def_level(self) -> int:
-    return self.enemy.def_level + self.def_level_mod
+    if self.enemy is None:
+        return 0
+    up = max(0, int(self.enemy.get_status("def_lvl_up", 0)))
+    down = max(0, int(self.enemy.get_status("def_lvl_down", 0)))
+    return (
+        self.enemy.effective_defense
+        + self.def_level_mod
+        + up
+        - down
+        - self.enemy.tremor_decay_def_level_down()
+    )
 ```
 
-Returns the enemy's effective defense level, allowing effects to dynamically lower it via `def_level_mod`.
+Returns the target's defense level, summing four independent sources: the enemy's own `effective_defense` (`base_level + defense_level`), the per-resolution `def_level_mod` an effect can write, the volatile `def_lvl_up`/`def_lvl_down` statuses, and Tremor Decay's reduction. Decay is derived on read rather than stored as a status, so it can never disagree with the Tremor state it comes from and is untouched by the turn-end status sweep.
+
+#### `effective_ol` (property)
+
+```python
+@property
+def effective_ol(self) -> int:
+    if self.unit is None:
+        return self.ol
+    up = max(0, int(self.unit.get_status("off_lvl_up", 0)))
+    down = max(0, int(self.unit.get_status("off_lvl_down", 0)))
+    return self.ol + up - down
+```
+
+The attacker-side mirror. `ol` stays the raw figure so Sin Resonance can add to it once per skill; the statuses layer on at read time and are swept at turn end. Returns `self.ol` unchanged when there is no attacker — the lightweight-env path and turn-wide passive broadcasts both leave `unit` as `None`.
 
 #### `get_target(name)`
 
@@ -242,7 +271,8 @@ Both the enemy and unit fire `on_skill_start` on all their active `StatusEffect`
 ### Phase 3 — Recalculate Static & Skill Conditions
 
 ```python
-ol_mult = (env.ol - env.def_level) / (abs(env.def_level - env.ol) + 25)
+ol_diff = env.effective_ol - env.def_level
+ol_mult = ol_diff / (abs(ol_diff) + 25)
 env.static = 1 + env.p_res_mod + env.s_res_mod + ol_mult
             + (enemy.observation_level * 0.03) + (clash_count * 0.03)
 
@@ -251,7 +281,7 @@ for i, effect in enumerate(self.conditions):
 env.update_apply_queue()
 ```
 
-Static is **recomputed** because Phase 1/2 effects may have changed `env.ol`, `env.def_level`, or resist mods. Note `clash_count * 0.03` — each clash win adds +3% to the static multiplier.
+Static is **recomputed** because Phase 1/2 effects may have changed `env.ol`, `env.def_level`, resist mods, or the Offense/Defense Level statuses those two properties read. Note `clash_count * 0.03` — each clash win adds +3% to the static multiplier.
 
 Then the skill's own `self.conditions` effects are applied — these are skill-level conditional buffs defined in the SKILLS dictionary (e.g., "if target has 7+ Rupture, gain +2 coin power").
 
@@ -327,7 +357,8 @@ Active effects fire their mid-update — after coin effects but before damage. A
 #### 4f. Damage Calculation (per coin)
 
 ```python
-ol_mult = (env.ol - env.def_level) / (abs(env.def_level - env.ol) + 25)
+ol_diff = env.effective_ol - env.def_level
+ol_mult = ol_diff / (abs(ol_diff) + 25)
 env.static = 1.00 + env.s_res_mod + ol_mult + env.p_res_mod
             + (enemy.observation_level * 0.00) + (clash_count * 0.03)
 if did_crit: env.static += env.crit_bonus
@@ -336,7 +367,7 @@ val = max(floor(env.current_power * env.static * env.dynamic), 1)
 env.current_damage += val
 ```
 
-Static is recomputed **per coin** because effects during the loop may have changed OL, def_level, or resists.
+Static is recomputed **per coin** because effects during the loop may have changed OL, def_level, or resists. This is also what lets an Offense/Defense Level status applied mid-skill take effect from the next coin onward.
 
 > **Note:** The observation level coefficient is `0.00` in the per-coin recalc (zeroed out). Observation level only contributes to the Phase 3 static, not the per-coin recalc.
 
@@ -404,7 +435,8 @@ Where:
 #### OL Multiplier Detail
 
 ```
-ol_mult = (OL - def_level) / (|def_level - OL| + 25)
+ol_diff = effective_ol - def_level
+ol_mult = ol_diff / (|ol_diff| + 25)
 ```
 
 | OL advantage | ol_mult |

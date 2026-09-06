@@ -59,6 +59,7 @@ def _dump_entity(entity, label: str) -> None:
         print(f"    sp                 = {entity.sp}")
         print(f"    poise              = {entity.get_status('poise', 0)}")
         print(f"    poise_count        = {entity.get_status('poise_count', 0)}")
+    if hasattr(entity, "skills"):
         print(f"    skills             = {[s.name for s in entity.skills]}")
 
 
@@ -92,6 +93,8 @@ def main() -> None:
         statuses={
             "tremor_potency": 20,
             "tremor_count": 9,
+            # Enemy Bleed here is consumed via the clash-Bleed block (this run
+            # sets is_clashing) and by Tremor hemmorage — not by landing coins.
             "bleed_potency": 4,
             "bleed_count": 2,
         },
