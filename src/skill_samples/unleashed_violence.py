@@ -99,21 +99,14 @@ def _combat_start_spend_tremor_count(env: Environment) -> None:
     """Spend up to 5 Tremor Count from the user (attack weight intentionally ignored)."""
     if env.unit is None:
         return
-    current = env.unit.get_status("tremor_count", 0)
-    spent = min(5, max(0, current))
-    remaining = max(0, current - spent)
-
-    if remaining == 0:
-        env.unit.remove_status("tremor_count")
-    else:
-        env.unit.set_status("tremor_count", min(remaining, 99))
+    env.unit.reduce_status("tremor_count", 5)
 
 
 def _clash_lose_lose_sp(env: Environment) -> None:
     """Lose 20 SP on clash lose."""
     if env.unit is None:
         return
-    env.unit.sp = max(-45, env.unit.sp - 20)
+    env.unit.adjust_sp(-20)
 
 
 def _persistent_negative_effect_damage_bonus(env: Environment) -> None:
@@ -136,8 +129,7 @@ def _on_kill_gain_tremor_count(env: Environment) -> None:
     """Gain +2 Tremor Count on kill."""
     if env.unit is None:
         return
-    current = env.unit.get_status("tremor_count", 0)
-    env.unit.set_status("tremor_count", min(current + 2, 99))
+    env.unit.add_status("tremor_count", 2)
 
 
 # =====================================================================
@@ -170,12 +162,7 @@ def _coin3_reduce_tremor_count_by_3(env: Environment) -> None:
     if env.enemy is None:
         return
 
-    count = env.enemy.get_status("tremor_count", 0)
-    new_count = max(0, count - 3)
-    if new_count == 0:
-        env.enemy.remove_status("tremor_count")
-    else:
-        env.enemy.set_status("tremor_count", min(new_count, 99))
+    env.enemy.reduce_status("tremor_count", 3)
 
 
 # =====================================================================

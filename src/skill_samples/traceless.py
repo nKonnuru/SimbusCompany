@@ -119,8 +119,7 @@ def _before_use_strider_mao(env: Environment) -> None:
 def _clash_win_rupture_count(env: Environment) -> None:
     """Inflict +2 Rupture Count on the enemy on clash win."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_count", 0)
-        env.enemy.set_status("rupture_count", min(current + 2, 99))
+        env.enemy.add_status("rupture_count", 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -131,8 +130,7 @@ def _clash_win_rupture_count(env: Environment) -> None:
 def _coin1_inflict_rupture_count(env: Environment) -> None:
     """Coin 1 on-hit: inflict +1 Rupture Count on the enemy."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_count", 0)
-        env.enemy.set_status("rupture_count", min(current + 1, 99))
+        env.enemy.add_status("rupture_count", 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -143,8 +141,7 @@ def _coin1_inflict_rupture_count(env: Environment) -> None:
 def _coin2_inflict_rupture_potency(env: Environment) -> None:
     """Coin 2 on-hit: inflict +1 Rupture Potency on the enemy."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_potency", 0)
-        env.enemy.set_status("rupture_potency", min(current + 1, 99))
+        env.enemy.add_status("rupture_potency", 1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -161,8 +158,7 @@ def _coin3_speed_damage_boost(env: Environment) -> None:
 def _coin3_inflict_rupture_potency(env: Environment) -> None:
     """Coin 3 on-hit: inflict +3 Rupture Potency on the enemy."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_potency", 0)
-        env.enemy.set_status("rupture_potency", min(current + 3, 99))
+        env.enemy.add_status("rupture_potency", 3)
 
 
 def _reuse_speed_10_condition(env: Environment) -> bool:

@@ -5,44 +5,101 @@ from __future__ import annotations
 import math
 
 
-# Status names in this registry are purged from enemies at turn end,
-# after all other turn-end processing has completed.
-TURN_END_ENEMY_EFFECTS_TO_CLEAR: set[str] = {
-    "slash_fragility",
+# Physical and Sin damage types, used to build per-type Fragility /
+# Damage Up status names (e.g. "slash_fragility", "wrath_dmg_up").
+PHYSICAL_DAMAGE_TYPES: tuple[str, ...] = ("slash", "pierce", "blunt")
+SIN_DAMAGE_TYPES: tuple[str, ...] = (
+    "wrath", "lust", "sloth", "gluttony", "gloom", "envy", "pride",
+)
+_ALL_DAMAGE_TYPES: tuple[str, ...] = PHYSICAL_DAMAGE_TYPES + SIN_DAMAGE_TYPES
+
+# Status names in this registry are purged from every entity (units and
+# enemies alike) at turn end, after all other turn-end processing has
+# completed. These are buffs/debuffs that last only "for this turn":
+# a generic Fragility ("fragility") and Damage Up ("dmg_up"), one
+# type-specific variant of each per physical/sin damage type
+# (e.g. "slash_fragility", "wrath_dmg_up"), Max/Min Speed Up,
+# Haste/Bind, and Offense/Defense Level Up/Down.
+#
+# Tremor Decay's defense-level reduction is deliberately absent: it is
+# derived on read (``Enemy.tremor_decay_def_level_down``), not a status,
+# so it survives this sweep and lasts exactly as long as Decay Tremor.
+TURN_END_EFFECTS_TO_CLEAR: set[str] = {
     "fragility",
+    "dmg_up",
+    "max_speed_up",
+    "min_speed_up",
+    "haste",
+    "bind",
+    "off_lvl_up",
+    "off_lvl_down",
+    "def_lvl_up",
+    "def_lvl_down",
+    *(f"{t}_fragility" for t in _ALL_DAMAGE_TYPES),
+    *(f"{t}_dmg_up" for t in _ALL_DAMAGE_TYPES),
 }
 
 
 def add_status(env, status_name: str, amount: int, cap: int = 99) -> None:
-    """Add ``amount`` to a count-style status on the unit or enemy."""
+    """
+    Add (or, for a negative amount, reduce) ``amount`` of a count-style
+    status on the unit or enemy (whichever the env is acting for).
+
+    Delegates to Enemy.add_status / Enemy.reduce_status, so this picks
+    up the same potency/count pairing behavior they provide (e.g.
+    gaining "poise_count" auto-initializes "poise_potency" to 1 if it
+    was 0; reducing either side of a pair to 0 removes both).
+    """
     target = env.unit if env.unit is not None else env.enemy
     if target is None:
         return
 
-    current = int(target.get_status(status_name, 0))
-    new_value = max(0, current + amount)
-    if new_value == 0:
-        target.remove_status(status_name)
+    if amount < 0:
+        target.reduce_status(status_name, -amount)
     else:
-        target.set_status(status_name, min(new_value, cap))
+        target.add_status(status_name, amount, cap=cap)
 
 
-def add_poise_count(env, amount: int, cap: int = 99) -> None:
-    """Add Poise Count and keep Poise potency/count synchronized on a unit."""
+def consume_charge_count(env, amount: int, cap: int = 99) -> int:
+    """
+    Spend up to ``amount`` Charge Count from the acting unit.
+
+    Every unit tracks lifetime Charge consumed via
+    ``Unit.charge_consumed_total`` regardless of identity. Units with
+    ``gains_charge_potency_on_consume`` set additionally gain +1 Charge
+    Potency for every 10 cumulative Charge Count consumed (fractional
+    progress carries over across separate consumptions).
+
+    Returns the amount actually consumed (may be less than ``amount``
+    if the unit didn't have enough Charge Count).
+    """
     if env.unit is None:
-        return
+        return 0
 
-    current_count = max(0, int(env.unit.get_status("poise_count", 0)))
-    new_count = min(max(0, current_count + amount), cap)
+    unit = env.unit
+    current = max(0, int(unit.get_status("charge_count", 0)))
+    consumed = min(max(0, amount), current)
+    if consumed <= 0:
+        return 0
 
-    if new_count == 0:
-        env.unit.remove_status("poise_count")
-        env.unit.remove_status("poise")
-        return
+    remaining = current - consumed
+    if remaining == 0:
+        unit.remove_status("charge_count")
+    else:
+        unit.set_status("charge_count", remaining)
 
-    if int(env.unit.get_status("poise", 0)) <= 0:
-        env.unit.set_status("poise", 1)
-    env.unit.set_status("poise_count", new_count)
+    prior_total = unit.charge_consumed_total
+    unit.charge_consumed_total = prior_total + consumed
+
+    if getattr(unit, "gains_charge_potency_on_consume", False):
+        prior_stacks = prior_total // 10
+        new_stacks = unit.charge_consumed_total // 10
+        gained = new_stacks - prior_stacks
+        if gained > 0:
+            current_potency = int(unit.get_status("charge_potency", 0))
+            unit.set_status("charge_potency", min(current_potency + gained, cap))
+
+    return consumed
 
 
 def queue_status(env, status_name: str, amount: int) -> None:
@@ -115,6 +172,104 @@ def check_enemy_hp_below(env, hp_ratio: float) -> bool:
     return (env.enemy.hp / env.enemy.max_hp) < float(hp_ratio)
 
 
+def check_resonance(env, sin: str | None = None, minimum: int = 2) -> bool:
+    """
+    Return True when *sin* reached at least *minimum* Sin Resonance.
+
+    ``sin=None`` means the resolving skill's own Affinity — the common
+    case for "if my sin resonates this turn, do X".
+
+    Returns False when the turn had no resonance computed at all (a
+    skill resolved outside a resonance-aware loop simply doesn't
+    trigger) rather than raising.
+    """
+    from src.resonance import sin_of  # local: src.resonance imports this module
+
+    result = env.global_state.get("resonance")
+    if result is None:
+        return False
+    target_sin = sin if sin is not None else sin_of(env.skill)
+    if target_sin is None:
+        return False
+    return result.count(target_sin) >= int(minimum)
+
+
+def get_resonance(env):
+    """
+    Return the turn's ``ResonanceResult``, or ``None`` if there is none.
+
+    The escape hatch for effects whose arithmetic no helper anticipates:
+    the result exposes every Reson. and A-Reson. line (``chains``,
+    ``indices_of``, ``chain_at``), so a custom ``apply`` callback can
+    compute whatever a skill needs.
+
+    ``None`` at Turn Start — the chain is not final until the pre-combat
+    checks have run — and from Combat Start onward it is populated.
+    """
+    return env.global_state.get("resonance")
+
+
+def check_absolute_resonance(env, minimum: int = 3) -> bool:
+    """
+    Return True when the resolving skill's **own** A-Reson. run is at
+    least *minimum* long.
+
+    This is the "am I in a big Absolute Resonance?" question, and it
+    reads the run this skill actually sits in — not the longest run
+    elsewhere in the turn, and not the sum across runs. For those, see
+    ``check_absolute_resonance_longest`` / ``_sum``.
+
+    Returns False where there is no single resolving skill — notably the
+    broadcast phases (turn_start / combat_start / turn_end), whose env
+    has ``chain_index == -1``. Ask by Affinity there instead.
+    """
+    result = env.global_state.get("resonance")
+    if result is None:
+        return False
+    chain = result.chain_at(getattr(env, "chain_index", -1))
+    return chain is not None and chain.length >= int(minimum)
+
+
+def check_absolute_resonance_sum(env, sin: str | None = None, minimum: int = 3) -> bool:
+    """
+    Return True when *sin*'s A-Reson. **summed across every run** reaches
+    *minimum* — two separate runs of 3 give 6.
+
+    ``sin=None`` means the resolving skill's own Affinity; pass an
+    explicit Affinity to use this from a broadcast phase.
+    """
+    from src.resonance import sin_of  # local: src.resonance imports this module
+
+    result = env.global_state.get("resonance")
+    if result is None:
+        return False
+    target_sin = sin if sin is not None else sin_of(env.skill)
+    if target_sin is None:
+        return False
+    return result.absolute_sum(target_sin) >= int(minimum)
+
+
+def check_absolute_resonance_longest(
+    env, sin: str | None = None, minimum: int = 3
+) -> bool:
+    """
+    Return True when *sin*'s **longest** A-Reson. run reaches *minimum*.
+
+    The dashboard rule: separate chains are counted separately rather
+    than summed, so two runs of 3 read as 3. ``sin=None`` means the
+    resolving skill's own Affinity.
+    """
+    from src.resonance import sin_of  # local: src.resonance imports this module
+
+    result = env.global_state.get("resonance")
+    if result is None:
+        return False
+    target_sin = sin if sin is not None else sin_of(env.skill)
+    if target_sin is None:
+        return False
+    return result.absolute_longest(target_sin) >= int(minimum)
+
+
 def deal_bonus_damage_from_current(env, multiplier: float, source: str = "bonus_damage") -> None:
     """Deal bonus damage based on current coin damage (floor(current_damage * multiplier))."""
     if env.enemy is None or env.target_killed:
@@ -135,7 +290,7 @@ def check_speed_advantage(env, difference_per_step: int = 1, max_steps: int = 1)
     """Return amount of steps of advantage the unit has over the target"""
     if env.unit is None or env.enemy is None:
         return False
-    difference = env.unit.speed - env.enemy.speed
+    difference = env.unit.effective_speed - env.enemy.effective_speed
     return min(difference // difference_per_step if difference > 0 else 0, max_steps)
 
 

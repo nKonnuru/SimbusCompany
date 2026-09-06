@@ -15,7 +15,9 @@ from src.utils import (
     add_status,
     check_count,
     check_enemy_hp_below,
+    consume_charge_count,
     deal_bonus_damage_from_current,
+    queue_status,
 )
 from src.characters.base import Character
 
@@ -166,8 +168,8 @@ def _make_skill_2_leap() -> Skill:
         Effect(
             name="On Kill: Gain 3 Haste next turn",
             phase=SkillPhase.ON_KILL,
-            apply=add_status,
-            args=("haste_count", 3),
+            apply=queue_status,
+            args=("haste", 3),
         )
     )
 
@@ -175,20 +177,34 @@ def _make_skill_2_leap() -> Skill:
 
 
 def _ddedr_on_use_consume_charge_and_gain_coin_power(env) -> None:
+    """
+    On Use:
+    - At 7~14 Charge Count: consume all Charge Count, and take
+      3 x (15 - Charge Count consumed)% max HP damage, to gain +5 Coin
+      Power.
+    - At 15+ Charge Count: consume exactly 15 Charge Count to gain
+      +5 Coin Power (no HP cost).
+    - Below 7 Charge Count: neither condition is met — nothing happens.
+    """
     if env.unit is None:
         return
 
     charge_count = int(env.unit.get_status("charge_count", 0))
-    consumed = 15 if charge_count >= 15 else charge_count
 
-    remaining = max(0, charge_count - consumed)
-    if remaining == 0:
-        env.unit.remove_status("charge_count")
+    if 7 <= charge_count <= 14:
+        consumed = consume_charge_count(env, charge_count)
+        percent = 3 * (15 - consumed)
+        hp_loss = max(0, math.floor(env.unit.max_hp * (percent / 100.0)))
+        if hp_loss > 0:
+            env.unit.take_damage(hp_loss)
+        env.global_state["ddedr_consumed_15"] = False
+        add_coin_power(env, 5)
+    elif charge_count >= 15:
+        consume_charge_count(env, 15)
+        env.global_state["ddedr_consumed_15"] = True
+        add_coin_power(env, 5)
     else:
-        env.unit.set_status("charge_count", remaining)
-
-    env.global_state["ddedr_consumed_15"] = consumed >= 15
-    add_coin_power(env, 5)
+        env.global_state["ddedr_consumed_15"] = False
 
 
 def _ddedr_on_kill_charge_barrier(env) -> None:

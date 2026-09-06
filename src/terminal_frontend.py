@@ -18,9 +18,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, project_root)
 
 import src.characters as characters
+from src.action import Action
 from src.enemy import Enemy
 from src.game_loop import GameLoop
 from src.skill import Skill
+from src.team import Team
 from src.unit import Unit
 
 
@@ -96,24 +98,84 @@ def _get_player_skill_options(unit: Unit) -> list[tuple[str, str, Skill]]:
     return options
 
 
-def _print_state(turn: int, unit: Unit, enemy: Enemy) -> None:
-    """Print HP and status overview for current turn."""
+def _unit_label(unit: Unit) -> str:
+    """Return ``Name - Identity`` when the unit carries an identity name."""
+    id_name = getattr(unit, "id_name", "")
+    return f"{unit.name} - {id_name}" if id_name else unit.name
+
+
+def _living_members(team: Team) -> list[Unit]:
+    """Return the team members still standing, in team order."""
+    return [unit for unit in team if unit.is_alive]
+
+
+# ── team selection ───────────────────────────────────────────────────
+
+
+def _select_team(loaders: list[LoadedUnit]) -> Team | None:
+    """
+    Prompt for an ordered team roster.
+
+    The order the keys are typed in *is* the team order — position 1
+    first. Repeating a key is allowed: builders are factories, so the
+    same Identity twice yields two independent units. Returns ``None``
+    if stdin closes.
+    """
+    print("Available IDs:")
+    for loader in loaders:
+        print(f"  {loader.key}: {loader.label}")
+    print("\nEnter IDs in team order, separated by spaces (e.g. \"2 1\").")
+    print("Team order does not set turn order (speed does), but it breaks speed ties.")
+
+    by_key = {loader.key: loader for loader in loaders}
+
+    while True:
+        raw = _safe_input(f"Select team (default {loaders[0].key}): ")
+        if raw is None:
+            print("\nInput stream closed during team selection. Exiting.")
+            return None
+
+        keys = raw.split()
+        if not keys:
+            keys = [loaders[0].key]
+
+        unknown = [key for key in keys if key not in by_key]
+        if unknown:
+            print(f"Invalid selection(s): {', '.join(unknown)}")
+            continue
+
+        team = Team(members=[by_key[key].builder() for key in keys])
+        print("\nTeam set:")
+        for position, unit in enumerate(team, start=1):
+            print(f"  Pos {position}: {_unit_label(unit)}")
+        return team
+
+
+# ── per-turn display ─────────────────────────────────────────────────
+
+
+def _print_state(turn: int, team: Team, enemy: Enemy) -> None:
+    """Print HP and status overview for every team member and the enemy."""
     print("\n" + "=" * 72)
     print(f"Turn {turn}")
     print("-" * 72)
-    print(
-        f"Unit  : {unit.name} | HP {unit.hp}/{unit.max_hp} | Speed {unit.speed} | "
-        f"Statuses: {_format_statuses(unit)}"
-    )
+    for position, unit in enumerate(team, start=1):
+        if not unit.is_alive:
+            print(f"  [{position}] {_unit_label(unit)} | DEFEATED")
+            continue
+        print(
+            f"  [{position}] {_unit_label(unit)} | HP {unit.hp}/{unit.max_hp} | "
+            f"Speed {unit.effective_speed} | Statuses: {_format_statuses(unit)}"
+        )
     print(
         f"Enemy : {enemy.name} | HP {enemy.hp}/{enemy.max_hp} | "
         f"Staggered: {enemy.is_staggered} | Statuses: {_format_statuses(enemy)}"
     )
 
 
-def _print_skill_menu(options: list[tuple[str, str, Skill]]) -> None:
-    """Print selectable skill actions."""
-    print("\nActions:")
+def _print_skill_menu(unit: Unit, options: list[tuple[str, str, Skill]]) -> None:
+    """Print selectable skill actions for one unit."""
+    print(f"\nActions for {_unit_label(unit)} (Speed {unit.effective_speed}):")
     for slot, label, skill in options:
         coin_count = len(skill.coins)
         print(
@@ -126,49 +188,107 @@ def _print_skill_menu(options: list[tuple[str, str, Skill]]) -> None:
     print("  quit: exit battle")
 
 
-def _run_selected_skill(unit: Unit, enemy: Enemy, skill: Skill) -> dict:
-    """Resolve one selected skill as one combat turn."""
-    old_skills = list(unit.skills)
-    old_speed = skill.speed
+def _prompt_team_actions(
+    team: Team, enemy: Enemy, history: list[dict]
+) -> list[Action] | None:
+    """
+    Prompt one skill per living member, in team order.
 
-    # Frontend uses one selected action per turn.
-    unit.skills = [skill]
-    skill.speed = unit.speed
+    Returns ``None`` to end the battle — either the player quit or stdin
+    closed, each having already printed its own message. Informational
+    commands (history/log/status) are handled inline and re-prompt the
+    same member.
+    """
+    actions: list[Action] = []
 
+    for unit in _living_members(team):
+        options = _get_player_skill_options(unit)
+        if not options:
+            print(f"{_unit_label(unit)} has no usable skills; skipping.")
+            continue
+
+        while True:
+            _print_skill_menu(unit, options)
+            raw_action = _safe_input("Choose action: ")
+            if raw_action is None:
+                print("\nInput stream closed. Ending battle.")
+                return None
+            raw = raw_action.strip().lower()
+
+            if raw == "quit":
+                print("Battle exited by user.")
+                return None
+            if raw == "history":
+                _print_battle_history(history)
+                continue
+            if raw == "log":
+                _print_full_log(history)
+                continue
+            if raw == "status":
+                for member in team:
+                    print(f"{_unit_label(member)} statuses : {_format_statuses(member)}")
+                print(f"Enemy statuses: {_format_statuses(enemy)}")
+                continue
+
+            selected = next(
+                (skill for slot, _label, skill in options if raw == slot), None
+            )
+            if selected is None:
+                print("Invalid action.")
+                continue
+
+            actions.append(Action(unit=unit, skill=selected, slot=raw))
+            break
+
+    return actions
+
+
+def _run_team_turn(
+    team: Team, enemy: Enemy, actions: list[Action]
+) -> tuple[list[dict], list[str], str]:
+    """
+    Resolve one full turn for the team.
+
+    Every Action leaves its clash/target/sequence config unset, so those
+    fall back to the turn-wide GameLoop values. Ordering is by speed
+    with team order breaking ties — handled inside ``run_turn``.
+
+    Returns the per-action results, the broadcast log, and the turn's
+    Sin Resonance summary.
+    """
     # Frontend mode assumption: all flips resolve as heads.
     loop = GameLoop(
-        units=[unit],
+        team=team,
         enemies=[enemy],
+        actions=actions,
         is_debugging=True,
         sequence=["heads"] * 64,
     )
     results = loop.run_turn()
-
-    unit.skills = old_skills
-    skill.speed = old_speed
-
-    selected_result = results[0] if results else {
-        "skill": skill.name,
-        "total_damage": 0,
-        "coin_damages": [],
-        "status_damages": {},
-        "log": [],
-    }
-
-    # Include turn-wide logs (turn start/end + status processing) for completeness.
-    selected_result["broadcast_log"] = list(loop._broadcast_env.log)  # noqa: SLF001
-    return selected_result
+    resonance = loop.resonance.summary() if loop.resonance is not None else "none"
+    return results, list(loop._broadcast_env.log), resonance  # noqa: SLF001
 
 
-def _print_turn_result(turn: int, result: dict, enemy: Enemy) -> None:
-    """Print compact turn resolution output."""
+def _print_turn_result(
+    turn: int, results: list[dict], enemy: Enemy, resonance: str = "none"
+) -> None:
+    """Print compact turn resolution output, in resolution order."""
     print("\n" + "-" * 72)
-    print(
-        f"Turn {turn} Result: {result['skill']} dealt {result['total_damage']} total damage "
-        f"(coin hits={result['coin_damages']})"
-    )
-    if result.get("status_damages"):
-        print(f"Status damage breakdown: {result['status_damages']}")
+    print(f"Resonance: {resonance}")
+    print(f"Turn {turn} Result (resolution order, fastest first):")
+    for position, result in enumerate(results, start=1):
+        actor = result.get("unit") or "-"
+        print(
+            f"  {position}. {actor}: {result['skill']} dealt "
+            f"{result['total_damage']} total damage "
+            f"(coin hits={result['coin_damages']})"
+        )
+        if result.get("status_damages"):
+            print(f"     Status damage: {result['status_damages']}")
+        if result.get("self_damage"):
+            print(f"     Self-inflicted: {result['self_damage']}")
+    turn_total = sum(result["total_damage"] for result in results)
+    print(f"  Turn total: {turn_total}")
     print(f"Enemy HP after turn: {enemy.hp}/{enemy.max_hp}")
 
 
@@ -179,10 +299,16 @@ def _print_battle_history(history: list[dict]) -> None:
         return
     print("\nTurn history:")
     for entry in history:
-        print(
-            f"  T{entry['turn']}: {entry['skill']} | damage={entry['total_damage']} "
-            f"| enemy_hp={entry['enemy_hp_after']} | unit_hp={entry['unit_hp_after']}"
+        skills = ", ".join(
+            f"{result.get('unit') or '-'}:{result['skill']}({result['total_damage']})"
+            for result in entry["results"]
         )
+        print(
+            f"  T{entry['turn']}: {skills} | turn_damage={entry['turn_damage']} "
+            f"| enemy_hp={entry['enemy_hp_after']}"
+        )
+        for name, hp, max_hp in entry["team_hp_after"]:
+            print(f"      {name}: {hp}/{max_hp}")
 
 
 def _print_full_log(history: list[dict]) -> None:
@@ -195,10 +321,12 @@ def _print_full_log(history: list[dict]) -> None:
     print("Battle log")
     print("#" * 72)
     for entry in history:
-        print("\n" + f"[Turn {entry['turn']}] {entry['skill']}")
-        print("  Skill/Coin log:")
-        for line in entry["log"]:
-            print(f"    {line}")
+        print("\n" + f"[Turn {entry['turn']}]")
+        for result in entry["results"]:
+            actor = result.get("unit") or "-"
+            print(f"  {actor} - {result['skill']}:")
+            for line in result["log"]:
+                print(f"    {line}")
         print("  Broadcast log:")
         for line in entry.get("broadcast_log", []):
             print(f"    {line}")
@@ -256,7 +384,7 @@ def _serialize_unit_skill_metadata(unit: Unit) -> list[str]:
 
 def _save_battle_report(
     *,
-    unit: Unit,
+    team: Team,
     enemy: Enemy,
     history: list[dict],
     level: int,
@@ -279,10 +407,17 @@ def _save_battle_report(
     lines.append(f"turns_resolved={len(history)}")
     lines.append("")
 
-    lines.extend(_serialize_entity_metadata(unit, "UNIT"))
+    lines.append("[TEAM_ORDER]")
+    for position, unit in enumerate(team, start=1):
+        lines.append(f"pos_{position}={_unit_label(unit)}")
     lines.append("")
-    lines.extend(_serialize_unit_skill_metadata(unit))
-    lines.append("")
+
+    for position, unit in enumerate(team, start=1):
+        lines.extend(_serialize_entity_metadata(unit, f"UNIT_{position}"))
+        lines.append("")
+        lines.extend(_serialize_unit_skill_metadata(unit))
+        lines.append("")
+
     lines.extend(_serialize_entity_metadata(enemy, "ENEMY"))
     lines.append("")
 
@@ -292,12 +427,22 @@ def _save_battle_report(
     else:
         for entry in history:
             lines.append(
-                f"T{entry['turn']} skill={entry['skill']} damage={entry['total_damage']} "
-                f"coin_damages={entry['coin_damages']} "
-                f"enemy_hp_after={entry['enemy_hp_after']} unit_hp_after={entry['unit_hp_after']}"
+                f"T{entry['turn']} turn_damage={entry['turn_damage']} "
+                f"enemy_hp_after={entry['enemy_hp_after']} "
+                f"resonance={entry.get('resonance', 'none')}"
             )
-            if entry.get("status_damages"):
-                lines.append(f"  status_damages={entry['status_damages']}")
+            for result in entry["results"]:
+                lines.append(
+                    f"  {result.get('unit') or '-'} skill={result['skill']} "
+                    f"damage={result['total_damage']} "
+                    f"coin_damages={result['coin_damages']}"
+                )
+                if result.get("status_damages"):
+                    lines.append(f"    status_damages={result['status_damages']}")
+                if result.get("self_damage"):
+                    lines.append(f"    self_damage={result['self_damage']}")
+            for name, hp, max_hp in entry["team_hp_after"]:
+                lines.append(f"  hp_after {name}={hp}/{max_hp}")
     lines.append("")
 
     lines.append("[DETAILED_LOG]")
@@ -306,10 +451,11 @@ def _save_battle_report(
     else:
         for entry in history:
             lines.append("")
-            lines.append(f"Turn {entry['turn']} - {entry['skill']}")
-            lines.append("  Skill/Coin log:")
-            for log_line in entry["log"]:
-                lines.append(f"    {log_line}")
+            lines.append(f"Turn {entry['turn']}")
+            for result in entry["results"]:
+                lines.append(f"  {result.get('unit') or '-'} - {result['skill']}:")
+                for log_line in result["log"]:
+                    lines.append(f"    {log_line}")
             lines.append("  Broadcast log:")
             for log_line in entry.get("broadcast_log", []):
                 lines.append(f"    {log_line}")
@@ -326,89 +472,60 @@ def run_terminal_frontend(level: int = 60, seed: int | None = None) -> int:
         random.seed(seed)
 
     loaders = _load_available_units(level=level)
-    print("Available units:")
-    for loader in loaders:
-        print(f"  {loader.key}: {loader.label}")
+    team = _select_team(loaders)
+    if team is None:
+        return 0
 
-    selected_loader = loaders[0]
-    while True:
-        raw_choice = _safe_input("Select unit (default 1): ")
-        if raw_choice is None:
-            print("\nInput stream closed during unit selection. Exiting.")
-            return 0
-        choice = raw_choice.strip().lower()
-        if choice in {"", selected_loader.key}:
-            break
-        matched = [loader for loader in loaders if loader.key == choice]
-        if matched:
-            selected_loader = matched[0]
-            break
-        print("Invalid selection.")
-
-    unit = selected_loader.builder()
     enemy = _make_sample_enemy()
     history: list[dict] = []
 
     turn = 1
-    while unit.is_alive and enemy.is_alive:
-        unit.roll_speed()
-        _print_state(turn, unit, enemy)
+    while _living_members(team) and enemy.is_alive:
+        for unit in _living_members(team):
+            unit.roll_speed()
+        _print_state(turn, team, enemy)
 
-        options = _get_player_skill_options(unit)
-        _print_skill_menu(options)
-
-        raw_action = _safe_input("Choose action: ")
-        if raw_action is None:
-            print("\nInput stream closed. Ending battle.")
+        actions = _prompt_team_actions(team, enemy, history)
+        if actions is None:
             break
-        raw = raw_action.strip().lower()
-
-        if raw == "quit":
-            print("Battle exited by user.")
-            break
-        if raw == "history":
-            _print_battle_history(history)
-            continue
-        if raw == "log":
-            _print_full_log(history)
-            continue
-        if raw == "status":
-            print(f"Unit statuses : {_format_statuses(unit)}")
-            print(f"Enemy statuses: {_format_statuses(enemy)}")
+        if not actions:
+            print("No actions selected.")
             continue
 
-        selected_skill: Skill | None = None
-        for slot, _label, skill in options:
-            if raw == slot:
-                selected_skill = skill
-                break
-
-        if selected_skill is None:
-            print("Invalid action.")
-            continue
-
-        result = _run_selected_skill(unit, enemy, selected_skill)
+        results, broadcast_log, resonance = _run_team_turn(team, enemy, actions)
         history.append(
             {
                 "turn": turn,
-                "skill": result["skill"],
-                "total_damage": result["total_damage"],
-                "coin_damages": list(result["coin_damages"]),
-                "status_damages": dict(result["status_damages"]),
-                "log": list(result["log"]),
-                "broadcast_log": list(result.get("broadcast_log", [])),
-                "unit_hp_after": unit.hp,
+                "resonance": resonance,
+                "results": [
+                    {
+                        "skill": result["skill"],
+                        "unit": result.get("unit"),
+                        "slot": result.get("slot"),
+                        "total_damage": result["total_damage"],
+                        "coin_damages": list(result["coin_damages"]),
+                        "status_damages": dict(result["status_damages"]),
+                        "self_damage": dict(result.get("self_damage", {})),
+                        "log": list(result["log"]),
+                    }
+                    for result in results
+                ],
+                "turn_damage": sum(result["total_damage"] for result in results),
+                "broadcast_log": list(broadcast_log),
+                "team_hp_after": [
+                    (unit.name, unit.hp, unit.max_hp) for unit in team
+                ],
                 "enemy_hp_after": enemy.hp,
             }
         )
 
-        _print_turn_result(turn, result, enemy)
+        _print_turn_result(turn, results, enemy, resonance)
         turn += 1
 
     print("\n" + "=" * 72)
-    if enemy.is_alive and not unit.is_alive:
-        print("Defeat: unit was defeated.")
-    elif unit.is_alive and not enemy.is_alive:
+    if enemy.is_alive and not _living_members(team):
+        print("Defeat: the whole team was defeated.")
+    elif _living_members(team) and not enemy.is_alive:
         print("Victory: enemy defeated.")
         _print_full_log(history)
     else:
@@ -416,7 +533,7 @@ def run_terminal_frontend(level: int = 60, seed: int | None = None) -> int:
 
     _print_battle_history(history)
     report_path = _save_battle_report(
-        unit=unit,
+        team=team,
         enemy=enemy,
         history=history,
         level=level,

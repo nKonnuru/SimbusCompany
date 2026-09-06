@@ -55,22 +55,19 @@ def _rupture_potency_condition(env: Environment) -> bool:
 def _clash_win_apply_rupture_count(env: Environment) -> None:
     """Apply 1 rupture count to the enemy on clash win."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_count", 0)
-        env.enemy.set_status("rupture_count", min(current + 1, 99))
+        env.enemy.add_status("rupture_count", 1)
 
 
 def _coin1_inflict_rupture_potency(env: Environment) -> None:
     """Coin 1 on-hit: inflict +1 rupture potency on the enemy."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_potency", 0)
-        env.enemy.set_status("rupture_potency", min(current + 1, 99))
+        env.enemy.add_status("rupture_potency", 1)
 
 
 def _coin2_inflict_rupture_count(env: Environment) -> None:
     """Coin 2 on-hit: inflict +1 rupture count on the enemy."""
     if env.enemy is not None:
-        current = env.enemy.get_status("rupture_count", 0)
-        env.enemy.set_status("rupture_count", min(current + 1, 99))
+        env.enemy.add_status("rupture_count", 1)
 
 
 def _reuse_speed_10_condition(env: Environment) -> bool:

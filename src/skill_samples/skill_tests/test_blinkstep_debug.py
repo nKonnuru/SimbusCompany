@@ -54,6 +54,7 @@ def _dump_entity(entity, label: str) -> None:
         print(f"    sp              = {entity.sp}")
         print(f"    poise           = {entity.get_status('poise', 0)}")
         print(f"    poise_count     = {entity.get_status('poise_count', 0)}")
+    if hasattr(entity, "skills"):
         print(f"    skills          = {[s.name for s in entity.skills]}")
 
 
@@ -121,7 +122,7 @@ def main() -> None:
         is_debugging=True,
         is_clashing=True,
         clash_won=True,
-        clash_count=1,  # won 1 clash → +3% static, enables bleed calc
+        clash_count=1,  # +3% static per clash; also the per-participant clash-Bleed proc count
     )
 
     # Snapshot the environment before resolution

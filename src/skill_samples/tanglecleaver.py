@@ -53,11 +53,7 @@ def _spend_tigermark_round(env: Environment) -> None:
     spent = rounds > 0
 
     if spent:
-        new_rounds = rounds - 1
-        if new_rounds == 0:
-            env.unit.remove_status("tigermark_round")
-        else:
-            env.unit.set_status("tigermark_round", min(new_rounds, 99))
+        env.unit.reduce_status("tigermark_round", 1)
 
     env.coin_env.flags["spent_tigermark_round"] = spent
 
@@ -94,29 +90,25 @@ def _persistent_coin_power_from_burn_tremor_potency(env: Environment) -> None:
 def _coin1_inflict_tremor_potency(env: Environment) -> None:
     if env.enemy is None:
         return
-    current = max(0, int(env.enemy.get_status("tremor_potency", 0)))
-    env.enemy.set_status("tremor_potency", min(current + 3, 99))
+    env.enemy.add_status("tremor_potency", 3)
 
 
 def _coin1_inflict_burn_potency(env: Environment) -> None:
     if env.enemy is None:
         return
-    current = max(0, int(env.enemy.get_status("burn_potency", 0)))
-    env.enemy.set_status("burn_potency", min(current + 3, 99))
+    env.enemy.add_status("burn_potency", 3)
 
 
 def _coin2_inflict_tremor_count(env: Environment) -> None:
     if env.enemy is None:
         return
-    current = max(0, int(env.enemy.get_status("tremor_count", 0)))
-    env.enemy.set_status("tremor_count", min(current + 3, 99))
+    env.enemy.add_status("tremor_count", 3)
 
 
 def _coin2_inflict_burn_count(env: Environment) -> None:
     if env.enemy is None:
         return
-    current = max(0, int(env.enemy.get_status("burn_count", 0)))
-    env.enemy.set_status("burn_count", min(current + 3, 99))
+    env.enemy.add_status("burn_count", 3)
 
 
 def _coin3_spent_damage_boost(env: Environment) -> None:
@@ -140,12 +132,7 @@ def _coin3_burst_then_reduce_once(env: Environment) -> None:
 
     env.on_tremor_burst()
 
-    count = max(0, int(env.enemy.get_status("tremor_count", 0)))
-    new_count = max(0, count - 1)
-    if new_count == 0:
-        env.enemy.remove_status("tremor_count")
-    else:
-        env.enemy.set_status("tremor_count", min(new_count, 99))
+    env.enemy.reduce_status("tremor_count", 1)
 
 
 def _coin3_extra_burst_packages_if_spent(env: Environment) -> None:
